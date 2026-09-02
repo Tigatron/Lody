@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { SessionTransientStore } from './session-transient-store';
+import { PromptActivityRecorder } from '@/session/prompt-activity-recorder';
 import type { SessionId } from '@lody/shared';
 
 const sid = (id: string) => id as SessionId;
@@ -403,6 +404,84 @@ describe('SessionTransientStore', () => {
       expect(store.getTurnRef(id, 'turn-other')).toBeUndefined();
       store.clearTurnState(id);
       expect(store.getTurnRef(id, 'turn-1')).toBeUndefined();
+    });
+
+    it('keeps the prompt-activity recorder across clearTurnState', () => {
+      // The replay gate is consulted AFTER a turn ends, so turn-scoped cleanup
+      // would erase the evidence exactly when it is needed. That is the mistake
+      // `acpFlushCountInTurn` already made: it is zeroed here, so the gate went
+      // blind at the only moment it mattered.
+      const store = new SessionTransientStore();
+      const id = sid('s1');
+
+      const epoch = store.beginTurn(id, { turnId: 'turn-1', ownsACPUpdates: false });
+      const recorder = new PromptActivityRecorder();
+      const ref = { turnId: 'turn-1', turnEpoch: epoch, assistantEntryId: 'turn-1' };
+      expect(store.bindTurnForPrompt(id, ref, recorder)).toBe('bound');
+      recorder.recordSideEffect();
+
+      store.clearTurnState(id);
+
+      expect(store.observePromptActivityForTurn(id, 'turn-1')).toBe('dropped_prompt_activity');
+      expect(store.getBoundPromptActivityRecorder(id)).toBe(recorder);
+    });
+
+    it('drops the recorder with the session and reports unknown afterwards', () => {
+      const store = new SessionTransientStore();
+      const id = sid('s1');
+
+      const epoch = store.beginTurn(id, { turnId: 'turn-1' });
+      store.bindTurnForPrompt(
+        id,
+        { turnId: 'turn-1', turnEpoch: epoch, assistantEntryId: 'turn-1' },
+        new PromptActivityRecorder()
+      );
+
+      store.deleteSession(id);
+
+      expect(store.observePromptActivityForTurn(id, 'turn-1')).toBe('unknown');
+    });
+
+    it('reports unknown for a turn the bound recorder does not belong to', () => {
+      const store = new SessionTransientStore();
+      const id = sid('s1');
+
+      const epoch = store.beginTurn(id, { turnId: 'turn-1' });
+      store.bindTurnForPrompt(
+        id,
+        { turnId: 'turn-1', turnEpoch: epoch, assistantEntryId: 'turn-1' },
+        new PromptActivityRecorder()
+      );
+
+      expect(store.observePromptActivityForTurn(id, 'turn-1')).toBe('none');
+      expect(store.observePromptActivityForTurn(id, 'turn-2')).toBe('unknown');
+    });
+
+    it('replaces the bound recorder when a later turn binds', () => {
+      const store = new SessionTransientStore();
+      const id = sid('s1');
+
+      const firstEpoch = store.beginTurn(id, { turnId: 'turn-1' });
+      const first = new PromptActivityRecorder();
+      store.bindTurnForPrompt(
+        id,
+        { turnId: 'turn-1', turnEpoch: firstEpoch, assistantEntryId: 'turn-1' },
+        first
+      );
+      first.recordSideEffect();
+      store.clearTurnState(id);
+
+      const secondEpoch = store.beginTurn(id, { turnId: 'turn-2' });
+      const second = new PromptActivityRecorder();
+      store.bindTurnForPrompt(
+        id,
+        { turnId: 'turn-2', turnEpoch: secondEpoch, assistantEntryId: 'turn-2' },
+        second
+      );
+
+      // The new turn starts clean, and the superseded turn is no longer readable.
+      expect(store.observePromptActivityForTurn(id, 'turn-2')).toBe('none');
+      expect(store.observePromptActivityForTurn(id, 'turn-1')).toBe('unknown');
     });
 
     it('clears late ACP update routing when ACP replay suppression begins', () => {
