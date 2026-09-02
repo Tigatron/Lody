@@ -9,8 +9,9 @@
  * (`ownsACPUpdates === false`, because visible dispatch does not claim ACP
  * routing until its prompt starts). The old handler answered that event with a
  * no-turnId `finalizeACPState`, which cleared the turn; the fallback's routing
- * claim then found an idle turn, and every one of the 505 seconds of agent
- * output was dropped, after which the turn was recorded as `agent_no_output`.
+ * bind then found an idle turn and could not bind, and every one of the 505
+ * seconds of agent output was dropped, after which the turn was recorded as
+ * `agent_no_output`.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -43,8 +44,11 @@ type MessageHandlerHost = {
       sessionDoc: SessionDocument;
       deferACPUpdateTarget?: boolean;
     }
-  ): string;
-  activateConversationTurnForACPUpdates(sessionId: SessionId, turnId: string): void;
+  ): { turnId: string; turnEpoch: number; assistantEntryId: string };
+  bindConversationTurnForPrompt(
+    sessionId: SessionId,
+    turnRef: { turnId: string; turnEpoch: number; assistantEntryId: string }
+  ): 'bound' | 'session_state_missing' | 'turn_superseded';
   beginACPReplaySuppression(sessionId: SessionId): void;
   endACPReplaySuppression(sessionId: SessionId): void;
   createAssistantEntryForTurn(
@@ -131,11 +135,12 @@ describe('MessageHandler session lifecycle events vs. an owned turn', () => {
     try {
       setActiveTurn(true, `assistant:${userTurnId}`);
 
-      const turnId = host.beginConversationTurn(sessionId, userTurnId, {
+      const turnRef = host.beginConversationTurn(sessionId, userTurnId, {
         dispatchSource: 'crdt',
         sessionDoc: doc,
         deferACPUpdateTarget: true,
       });
+      const turnId = turnRef.turnId;
       await host.createAssistantEntryForTurn(sessionId, doc, turnId, undefined, userTurnId);
 
       // The failed restore terminates its own Session instance.
@@ -143,7 +148,7 @@ describe('MessageHandler session lifecycle events vs. an owned turn', () => {
       await vi.advanceTimersByTimeAsync(50);
 
       // The fallback's new ACP session starts prompting and claims routing.
-      host.activateConversationTurnForACPUpdates(sessionId, turnId);
+      expect(host.bindConversationTurnForPrompt(sessionId, turnRef)).toBe('bound');
       host.enqueueACPUpdate(sessionId, agentChunk(sessionId, 'hello'));
       host.enqueueACPUpdate(sessionId, agentChunk(sessionId, ' world'));
       await vi.advanceTimersByTimeAsync(50);
@@ -171,11 +176,12 @@ describe('MessageHandler session lifecycle events vs. an owned turn', () => {
     try {
       setActiveTurn(true, `assistant:${userTurnId}`);
 
-      const turnId = host.beginConversationTurn(sessionId, userTurnId, {
+      const turnRef = host.beginConversationTurn(sessionId, userTurnId, {
         dispatchSource: 'crdt',
         sessionDoc: doc,
         deferACPUpdateTarget: true,
       });
+      const turnId = turnRef.turnId;
       await host.createAssistantEntryForTurn(sessionId, doc, turnId, undefined, userTurnId);
 
       // Restore path: suppress ACP replay, `loadSession` throws
@@ -186,7 +192,7 @@ describe('MessageHandler session lifecycle events vs. an owned turn', () => {
 
       // Fallback succeeds on a fresh ACP session and the prompt starts.
       host.endACPReplaySuppression(sessionId);
-      host.activateConversationTurnForACPUpdates(sessionId, turnId);
+      expect(host.bindConversationTurnForPrompt(sessionId, turnRef)).toBe('bound');
       host.enqueueACPUpdate(sessionId, agentChunk(sessionId, 'real answer'));
       await vi.advanceTimersByTimeAsync(50);
 
@@ -263,7 +269,7 @@ describe('MessageHandler session lifecycle events vs. an owned turn', () => {
     try {
       setActiveTurn(false);
 
-      const turnId = host.beginConversationTurn(sessionId, 'user-turn-3', {
+      const { turnId } = host.beginConversationTurn(sessionId, 'user-turn-3', {
         dispatchSource: 'crdt',
         sessionDoc: doc,
       });

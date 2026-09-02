@@ -45,7 +45,7 @@ type MessageHandlerHost = {
     sessionId: SessionId,
     userTurnId?: string,
     gateContext?: { dispatchSource?: 'crdt' | 'rpc' | 'queue'; sessionDoc: SessionDocument }
-  ): string;
+  ): { turnId: string; turnEpoch: number; assistantEntryId: string };
   createAssistantEntryForTurn(
     sessionId: SessionId,
     sessionDoc: SessionDocument,
@@ -139,7 +139,7 @@ describe('MessageHandler turn finalization compare-and-set', () => {
     const { repo, doc, host } = await createHarness(sessionId);
 
     try {
-      const turnId = host.beginConversationTurn(sessionId, userTurnId, {
+      const { turnId } = host.beginConversationTurn(sessionId, userTurnId, {
         dispatchSource: 'crdt',
         sessionDoc: doc,
       });
@@ -190,7 +190,7 @@ describe('MessageHandler turn finalization compare-and-set', () => {
     const { repo, doc, host } = await createHarness(sessionId);
 
     try {
-      const turnId = host.beginConversationTurn(sessionId, userTurnId, {
+      const { turnId } = host.beginConversationTurn(sessionId, userTurnId, {
         dispatchSource: 'crdt',
         sessionDoc: doc,
       });
@@ -218,7 +218,7 @@ describe('MessageHandler turn finalization compare-and-set', () => {
     const { repo, doc, host } = await createHarness(sessionId);
 
     try {
-      const turnId = host.beginConversationTurn(sessionId, userTurnId, {
+      const { turnId } = host.beginConversationTurn(sessionId, userTurnId, {
         dispatchSource: 'crdt',
         sessionDoc: doc,
       });

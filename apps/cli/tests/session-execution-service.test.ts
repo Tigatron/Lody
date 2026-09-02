@@ -45,6 +45,16 @@ const createLaunchConfig = (overrides: Partial<AgentConfigMeta> = {}): AgentConf
   ...overrides,
 });
 
+/**
+ * `beginConversationTurn` hands back the whole turn identity, because
+ * `bindTurnForPrompt` is an authoritative write that must name the exact epoch.
+ */
+const turnRefOf = (turnId: string, turnEpoch = 1) => ({
+  turnId,
+  turnEpoch,
+  assistantEntryId: turnId,
+});
+
 const createSilentLogger = (): Logger => ({
   info: () => {},
   warn: () => {},
@@ -136,8 +146,8 @@ const createBaseDeps = (
     setSessionActivePresencePhase: vi.fn(),
     beginACPReplaySuppression: vi.fn(),
     endACPReplaySuppression: vi.fn(),
-    beginConversationTurn: vi.fn(() => 'turn-1'),
-    activateConversationTurnForACPUpdates: vi.fn(),
+    beginConversationTurn: vi.fn(() => turnRefOf('turn-1')),
+    bindConversationTurnForPrompt: vi.fn(() => 'bound' as const),
     clearConversationTurn: vi.fn(),
     getActiveTurnId: vi.fn(() => undefined),
     clearActiveTurnId: vi.fn(() => {}),
@@ -236,7 +246,9 @@ describe('SessionExecutionService', () => {
         repo: { upsertDocMeta },
         getOrCreateSessionDoc: vi.fn(async () => sessionDoc),
       } as unknown as LoroDocumentManager,
-      beginConversationTurn: vi.fn((_sessionId, userTurnId) => `assistant:${userTurnId}`),
+      beginConversationTurn: vi.fn((_sessionId, userTurnId) =>
+        turnRefOf(`assistant:${userTurnId}`)
+      ),
     });
     const service = new SessionExecutionService(deps);
     const sessionId = 'session-steer' as SessionId;
@@ -480,7 +492,7 @@ describe('SessionExecutionService', () => {
         updateAcpCapabilities: vi.fn(async () => {}),
       } as unknown as LoroDocumentManager,
       beginConversationTurn: vi.fn((_sessionId: SessionId, userTurnId?: string) =>
-        userTurnId ? `assistant:${userTurnId}` : 'assistant:unknown'
+        turnRefOf(userTurnId ? `assistant:${userTurnId}` : 'assistant:unknown')
       ),
     });
     const service = new SessionExecutionService(deps);
@@ -512,15 +524,15 @@ describe('SessionExecutionService', () => {
     );
     expect(service.getExecutionSnapshot(sessionId).activeTurnId).toBe('assistant:user-a');
     expect(deps.turnFinalization.finalizeACPState).not.toHaveBeenCalled();
-    expect(deps.activateConversationTurnForACPUpdates).toHaveBeenCalledTimes(1);
+    expect(deps.bindConversationTurnForPrompt).toHaveBeenCalledTimes(1);
     const releaseB = vi.fn();
     applicationB.resolve({ steerId: 'steer-b', release: releaseB });
     await expect(steerB).resolves.toMatchObject({ applied: true, disposition: 'applied' });
     expect(releaseB).toHaveBeenCalledOnce();
-    expect(deps.activateConversationTurnForACPUpdates).toHaveBeenCalledTimes(2);
-    expect(
-      vi.mocked(deps.activateConversationTurnForACPUpdates).mock.invocationCallOrder[1]
-    ).toBeLessThan(releaseB.mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY);
+    expect(deps.bindConversationTurnForPrompt).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(deps.bindConversationTurnForPrompt).mock.invocationCallOrder[1]).toBeLessThan(
+      releaseB.mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY
+    );
 
     const steerC = service.steerSession({
       sessionId,
@@ -1361,7 +1373,7 @@ describe('SessionExecutionService', () => {
     const sessionDoc = {} as never;
     const deps = createBaseDeps({
       beginConversationTurn: vi.fn((_sessionId: SessionId, turn?: string) =>
-        turn ? `assistant:${turn}` : 'turn-1'
+        turnRefOf(turn ? `assistant:${turn}` : 'turn-1')
       ),
     });
     const service = new SessionExecutionService(deps);
@@ -1437,7 +1449,7 @@ describe('SessionExecutionService', () => {
         updateAcpCapabilities: vi.fn(async () => {}),
       } as unknown as LoroDocumentManager,
       beginConversationTurn: vi.fn((_sessionId: SessionId, turn?: string) =>
-        turn ? `assistant:${turn}` : 'turn-1'
+        turnRefOf(turn ? `assistant:${turn}` : 'turn-1')
       ),
     });
     const service = new SessionExecutionService(deps);
@@ -1542,7 +1554,7 @@ describe('SessionExecutionService', () => {
         updateAcpCapabilities: vi.fn(async () => {}),
       } as unknown as LoroDocumentManager,
       beginConversationTurn: vi.fn((_sessionId: SessionId, turn?: string) =>
-        turn ? `assistant:${turn}` : 'turn-1'
+        turnRefOf(turn ? `assistant:${turn}` : 'turn-1')
       ),
     });
     let accessAllowed!: () => void;
@@ -1664,8 +1676,9 @@ describe('SessionExecutionService', () => {
       clearSessionActivePresence: vi.fn(() => {
         events.push('active-clear');
       }),
-      activateConversationTurnForACPUpdates: vi.fn(() => {
-        events.push('activate-acp-target');
+      bindConversationTurnForPrompt: vi.fn(() => {
+        events.push('bind-acp-target');
+        return 'bound' as const;
       }),
       syncLiveActivitySummary: vi.fn(async () => {
         events.push('live-activity-sync');
@@ -1693,7 +1706,7 @@ describe('SessionExecutionService', () => {
     });
 
     const promptResolvedAt = events.indexOf('prompt-resolved');
-    const acpTargetActivatedAt = events.indexOf('activate-acp-target');
+    const acpTargetActivatedAt = events.indexOf('bind-acp-target');
     const activeClearedAt = events.indexOf('active-clear');
     const idleAfterPromptAt = events.indexOf('status:idle');
     const finalizeStartedAt = events.indexOf('finalize-acp');
@@ -1704,6 +1717,165 @@ describe('SessionExecutionService', () => {
     expect(idleAfterPromptAt).toBeGreaterThan(promptResolvedAt);
     expect(finalizeStartedAt).toBeGreaterThan(idleAfterPromptAt);
     expect(activeClearedAt).toBeGreaterThan(finalizeStartedAt);
+  });
+
+  it('binds ACP routing after the replay suppression release and before the prompt', async () => {
+    // The ordering that used to be enforced by accident: the old conditional
+    // claim silently no-opped if it ran too early, so nothing failed. An
+    // authoritative write has no backstop — binding before the release writes
+    // `loadSession` replay into the new turn's assistant entry. Uses the restore
+    // path, because that is the only one that arms replay suppression.
+    const sessionId = 'session-bind-order' as SessionId;
+    const order: string[] = [];
+    const meta = { acpSessionId: 'acp-bind-order' as ACPSessionId, isArchived: false };
+    let history: unknown[] = [];
+    const sessionDoc = {
+      getMetaState: vi.fn(async () => meta),
+      setStatus: vi.fn(async () => {}),
+      setBaseBranch: vi.fn(async () => {}),
+      waitUntilSynced: vi.fn(async () => {}),
+      getHistory: vi.fn(async () => history),
+      updateHistory: vi.fn(async (updater: (prev: unknown[]) => unknown[]) => {
+        history = updater(history);
+      }),
+    };
+    const agentClient = {
+      isCreated: vi.fn(() => true),
+      cancel: vi.fn(async () => {}),
+      prompt: vi.fn(async () => {
+        order.push('prompt');
+        return {};
+      }),
+      currentModel: undefined,
+    };
+    const restoredSession = {
+      sessionId,
+      acpSessionId: 'acp-bind-order' as ACPSessionId,
+      agentClient,
+      terminalManager: {} as unknown,
+      getWorkdir: () => '/tmp',
+      getHostWorkdir: () => '/tmp',
+      getParentSessionId: () => undefined,
+      exec: vi.fn(async () => ''),
+      terminate: vi.fn(async () => {}),
+      updateGitIdentity: vi.fn(),
+      createAgent: vi.fn(async () => 'acp-bind-order'),
+      applyExecutionPlaneLimits: vi.fn(async () => {}),
+    };
+    const deps = createBaseDeps({
+      beginConversationTurn: vi.fn(() => turnRefOf('assistant-bind-order')),
+      beginACPReplaySuppression: vi.fn(() => {
+        order.push('suppression-begin');
+      }),
+      endACPReplaySuppression: vi.fn(() => {
+        order.push('suppression-release');
+      }),
+      bindConversationTurnForPrompt: vi.fn(() => {
+        order.push('bind');
+        return 'bound' as const;
+      }),
+    });
+    const sessionManager = deps.sessionManager as unknown as {
+      getSession: ReturnType<typeof vi.fn>;
+      createSession: ReturnType<typeof vi.fn>;
+    };
+    sessionManager.getSession.mockReturnValue(null);
+    sessionManager.createSession.mockResolvedValue(restoredSession);
+    (
+      deps.workspaceDocument as unknown as { getOrCreateSessionDoc: ReturnType<typeof vi.fn> }
+    ).getOrCreateSessionDoc.mockResolvedValue(sessionDoc);
+
+    const service = new SessionExecutionService(deps);
+    await service.continueSession({
+      type: 'session/chat',
+      sessionId,
+      machineId: 'machine-1',
+      workspaceId: 'workspace-1' as WorkspaceId,
+      project: undefined,
+      acpSessionConfig: { prompt: 'hi', cliType: 'builtin', agentType: 'codex' },
+      userTurnId: 'turn-user-1',
+      userId: 'user-1',
+      userName: 'User',
+      userEmail: 'user@example.com',
+    });
+
+    expect(order).toContain('suppression-begin');
+    expect(order.filter((step) => step !== 'suppression-begin')).toEqual([
+      'suppression-release',
+      'bind',
+      'prompt',
+    ]);
+  });
+
+  it('refuses to prompt when ACP routing cannot be bound', async () => {
+    // Fail closed. A prompt whose output cannot be routed anywhere runs for
+    // minutes and is then reported as producing nothing.
+    const sessionId = 'session-bind-refused' as SessionId;
+    let history: Array<Record<string, unknown>> = [
+      { id: 'turn-user-1', role: 'user', status: 'pending', read: false },
+    ];
+    const sessionDoc = {
+      getMetaState: vi.fn(async () => ({ isArchived: false })),
+      setStatus: vi.fn(async () => {}),
+      waitUntilSynced: vi.fn(async () => {}),
+      getHistory: vi.fn(async () => history),
+      updateHistory: vi.fn(async (updater: (prev: typeof history) => typeof history) => {
+        history = updater(history);
+      }),
+    };
+    const agentClient = {
+      isCreated: vi.fn(() => true),
+      cancel: vi.fn(async () => {}),
+      prompt: vi.fn(async () => ({})),
+      currentModel: undefined,
+    };
+    const session = {
+      sessionId,
+      acpSessionId: 'acp-bind-refused' as ACPSessionId,
+      agentClient,
+      terminalManager: {} as unknown,
+      getWorkdir: () => '/tmp',
+      getHostWorkdir: () => '/tmp',
+      getParentSessionId: () => undefined,
+      exec: vi.fn(async () => ''),
+      terminate: vi.fn(async () => {}),
+      updateGitIdentity: vi.fn(),
+      createAgent: vi.fn(async () => 'acp-bind-refused'),
+      applyExecutionPlaneLimits: vi.fn(async () => {}),
+    };
+    const deps = createBaseDeps({
+      beginConversationTurn: vi.fn(() => turnRefOf('assistant-bind-refused')),
+      bindConversationTurnForPrompt: vi.fn(() => 'session_state_missing' as const),
+    });
+    (deps.sessionManager as unknown as { getSession: ReturnType<typeof vi.fn> }).getSession = vi.fn(
+      () => session
+    );
+    (
+      deps.workspaceDocument as unknown as { getOrCreateSessionDoc: ReturnType<typeof vi.fn> }
+    ).getOrCreateSessionDoc.mockResolvedValue(sessionDoc);
+
+    const service = new SessionExecutionService(deps);
+    await service.continueSession({
+      type: 'session/chat',
+      sessionId,
+      machineId: 'machine-1',
+      workspaceId: 'workspace-1' as WorkspaceId,
+      project: undefined,
+      acpSessionConfig: { prompt: 'hi', cliType: 'builtin', agentType: 'codex' },
+      userTurnId: 'turn-user-1',
+      userId: 'user-1',
+      userName: 'User',
+      userEmail: 'user@example.com',
+    });
+
+    // No prompt was sent, and the user sees an explicit pre-prompt failure.
+    expect(agentClient.prompt).not.toHaveBeenCalled();
+    expect(deps.recordChatFailure).toHaveBeenCalledWith(
+      sessionDoc,
+      'turn_pre_prompt_failed',
+      expect.stringContaining('routing could not be bound')
+    );
+    expect(history[0]?.status).toBe('failed');
   });
 
   it('restores and retries a stale in-memory ACP session when the connection is closed', async () => {
@@ -3185,7 +3357,7 @@ describe('SessionExecutionService', () => {
     } as unknown as SessionManager;
     const deps = createBaseDeps({
       sessionManager,
-      beginConversationTurn: vi.fn(() => 'assistant-restore-interrupt'),
+      beginConversationTurn: vi.fn(() => turnRefOf('assistant-restore-interrupt')),
       workspaceDocument: {
         repo: {
           upsertDocMeta,
@@ -4009,7 +4181,7 @@ describe('SessionExecutionService', () => {
     } as unknown as SessionManager;
     const deps = createBaseDeps({
       sessionManager,
-      beginConversationTurn: vi.fn(() => 'assistant-create-interrupt'),
+      beginConversationTurn: vi.fn(() => turnRefOf('assistant-create-interrupt')),
       workspaceDocument: {
         repo: {
           upsertDocMeta,
@@ -4572,7 +4744,7 @@ describe('SessionExecutionService', () => {
 
     const deps = createBaseDeps({
       sessionManager,
-      beginConversationTurn: vi.fn(() => 'assistant-pre-prompt-fail'),
+      beginConversationTurn: vi.fn(() => turnRefOf('assistant-pre-prompt-fail')),
       workspaceDocument: {
         repo: {
           upsertDocMeta,
@@ -4683,7 +4855,7 @@ describe('SessionExecutionService', () => {
     } as unknown as SessionManager;
     const deps = createBaseDeps({
       sessionManager,
-      beginConversationTurn: vi.fn(() => 'assistant-pre-prompt-interrupt'),
+      beginConversationTurn: vi.fn(() => turnRefOf('assistant-pre-prompt-interrupt')),
       workspaceDocument: {
         repo: {
           upsertDocMeta,
@@ -4789,7 +4961,7 @@ describe('SessionExecutionService', () => {
       sessionManager,
       beginConversationTurn: vi.fn(() => {
         activeTurnId = 'assistant-turn-1';
-        return activeTurnId;
+        return turnRefOf(activeTurnId);
       }),
       getActiveTurnId: vi.fn(() => activeTurnId),
       clearActiveTurnId: vi.fn((_sessionId, turnId) => {
@@ -4905,7 +5077,7 @@ describe('SessionExecutionService', () => {
       sessionManager,
       beginConversationTurn: vi.fn(() => {
         activeTurnId = 'assistant-prompt-cancel';
-        return activeTurnId;
+        return turnRefOf(activeTurnId);
       }),
       getActiveTurnId: vi.fn(() => activeTurnId),
       clearActiveTurnId: vi.fn((_sessionId, turnId) => {
@@ -5183,7 +5355,7 @@ describe('SessionExecutionService', () => {
       sessionManager,
       beginConversationTurn: vi.fn(() => {
         activeTurnId = turnId;
-        return turnId;
+        return turnRefOf(turnId);
       }),
       getActiveTurnId: vi.fn(() => activeTurnId),
       clearActiveTurnId: vi.fn((_sessionId, id) => {
@@ -5297,7 +5469,7 @@ describe('SessionExecutionService', () => {
       sessionManager,
       beginConversationTurn: vi.fn(() => {
         activeTurnId = 'assistant-prompt-cancel-immediate';
-        return activeTurnId;
+        return turnRefOf(activeTurnId);
       }),
       getActiveTurnId: vi.fn(() => activeTurnId),
       clearActiveTurnId: vi.fn((_sessionId, turnId) => {
@@ -5414,7 +5586,7 @@ describe('SessionExecutionService', () => {
       sessionManager,
       beginConversationTurn: vi.fn(() => {
         activeTurnId = 'assistant-prompt-cancel-resolved';
-        return activeTurnId;
+        return turnRefOf(activeTurnId);
       }),
       getActiveTurnId: vi.fn(() => activeTurnId),
       clearActiveTurnId: vi.fn((_sessionId, turnId) => {
@@ -5517,7 +5689,7 @@ describe('SessionExecutionService', () => {
     let service: SessionExecutionService;
     const deps = createBaseDeps({
       sessionManager,
-      beginConversationTurn: vi.fn(() => 'assistant-finalizing-turn'),
+      beginConversationTurn: vi.fn(() => turnRefOf('assistant-finalizing-turn')),
       getActiveTurnId: vi.fn(() => undefined),
       workspaceDocument: {
         repo: {
@@ -5635,7 +5807,7 @@ describe('SessionExecutionService', () => {
     });
     const deps = createBaseDeps({
       sessionManager,
-      beginConversationTurn: vi.fn(() => 'assistant-finalizing-auto-prompt-turn'),
+      beginConversationTurn: vi.fn(() => turnRefOf('assistant-finalizing-auto-prompt-turn')),
       getActiveTurnId: vi.fn(() => undefined),
       workspaceDocument: {
         repo: {
