@@ -1036,8 +1036,16 @@ export class LodyOperationCoordinator {
         item.continuation.reason.code === 'CONFIGURATION_UNAVAILABLE'
     );
     if (completionWasUnavailable) return 'configuration_unavailable';
-    for (const entry of history.slice(index + 1)) {
-      if (entry.role === 'assistant') return 'assistant_history';
+    const continuationHistory = history.slice(index + 1);
+    const assistantTurnId = `assistant:${systemTurnId}`;
+    if (
+      continuationHistory.some(
+        (entry) => entry.id === assistantTurnId && entry.role === 'assistant'
+      )
+    ) {
+      return 'assistant_history';
+    }
+    for (const entry of continuationHistory) {
       if (entry.role === 'user') return null;
       if (
         entry.role === 'system' &&
