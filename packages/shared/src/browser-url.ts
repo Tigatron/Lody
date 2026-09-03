@@ -145,18 +145,51 @@ export const classifyBrowserHostname = (hostname: string): BrowserTargetClass =>
   return 'public';
 };
 
+export type ResolvedBrowserAddressContext = {
+  /**
+   * Whether the request that produced this answer is handed to a proxy instead of being
+   * dialed directly. The caller must have established this positively — see
+   * `isProxiedPacResult`. It cannot be inferred from the address, which is the whole point:
+   * 198.18.0.0/15 looks identical whether a fake-IP proxy synthesized it or a hostile DNS
+   * record points at a real host in that range on the user's network.
+   */
+  viaProxy: boolean;
+};
+
 /**
  * Classifies an address that the resolver returned for a public hostname, as opposed to a
- * hostname the user typed. The only difference from `classifyBrowserHostname` is 198.18.0.0/15:
- * a public name resolving there is a fake-IP proxy's synthetic answer, and the connection to it
- * is intercepted by that proxy and forwarded by domain, so it is treated as public. A literal
- * 198.18.x.x address is still prohibited because nothing legitimate lives in that range.
+ * hostname the user typed. The only difference from `classifyBrowserHostname` is 198.18.0.0/15,
+ * and only for a proxied request: a public name resolving there is then a fake-IP proxy's
+ * synthetic answer, and the connection is intercepted by that proxy and forwarded by domain,
+ * so nothing dials the address itself. Without a proxy the resolved address IS what gets
+ * dialed, so it stays prohibited exactly like the literal address a user could type.
  */
-export const classifyResolvedBrowserAddress = (address: string): BrowserTargetClass => {
-  const host = stripIpv6Brackets(address);
-  const ipv4 = parseIpv4(host) ?? mappedIpv4(parseIpv6(host) ?? []);
-  if (ipv4 && isBenchmarkingIpv4(ipv4)) return 'public';
+export const classifyResolvedBrowserAddress = (
+  address: string,
+  { viaProxy }: ResolvedBrowserAddressContext
+): BrowserTargetClass => {
+  if (viaProxy) {
+    const host = stripIpv6Brackets(address);
+    const ipv4 = parseIpv4(host) ?? mappedIpv4(parseIpv6(host) ?? []);
+    if (ipv4 && isBenchmarkingIpv4(ipv4)) return 'public';
+  }
   return classifyBrowserHostname(address);
+};
+
+/**
+ * Whether a PAC-format proxy resolution ("PROXY host:port; DIRECT", "SOCKS5 host:port",
+ * "DIRECT") means the request is definitely handed to a proxy.
+ *
+ * A `DIRECT` entry anywhere disqualifies the result: Chromium uses the list in order and
+ * falls back to a direct connection when a proxy is unreachable, so the synthetic fake-IP
+ * answer could still become a real destination.
+ */
+export const isProxiedPacResult = (pacResult: string): boolean => {
+  const entries = pacResult
+    .split(';')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+  return entries.length > 0 && entries.every((entry) => entry.toUpperCase() !== 'DIRECT');
 };
 
 const parseWithDefaultScheme = (input: string): URL => {

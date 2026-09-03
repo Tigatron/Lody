@@ -6,7 +6,11 @@ import {
   type ElectronPublicBrowserResult,
   type ElectronPublicBrowserState
 } from '@lody/shared/electron-ipc'
-import { classifyResolvedBrowserAddress, parseBrowserAddress } from '@lody/shared/browser-url'
+import {
+  classifyResolvedBrowserAddress,
+  isProxiedPacResult,
+  parseBrowserAddress
+} from '@lody/shared/browser-url'
 import { formatUnknownError } from '../utils'
 import { isNavigationAbortError, mergePublicBrowserState } from './public-browser-state'
 
@@ -40,7 +44,22 @@ const toState = (
     patch
   )
 
-const resolvePublicHostname = async (browserSession: Session, hostname: string): Promise<void> => {
+/**
+ * Whether Chromium will hand this request to a proxy rather than dialing the address it
+ * resolved. `resolveProxy` is Chromium's own answer, so it accounts for PAC scripts and
+ * bypass lists that reading the proxy configuration would miss.
+ */
+const isProxiedRequest = async (browserSession: Session, url: string): Promise<boolean> => {
+  try {
+    return isProxiedPacResult(await browserSession.resolveProxy(url))
+  } catch {
+    // Fail closed: an unresolvable proxy configuration is not positive identification.
+    return false
+  }
+}
+
+const resolvePublicHostname = async (browserSession: Session, url: URL): Promise<void> => {
+  const hostname = url.hostname
   if (nodeNet.isIP(hostname.replace(/^\[|\]$/g, '')) !== 0) return
 
   const results = await Promise.allSettled([
@@ -53,12 +72,20 @@ const resolvePublicHostname = async (browserSession: Session, hostname: string):
   if (endpoints.length === 0) {
     throw new Error(`Unable to resolve public browser host: ${hostname}`)
   }
-  const blocked = endpoints.find(
-    (endpoint) => classifyResolvedBrowserAddress(endpoint.address) !== 'public'
+  const blocked = endpoints.filter(
+    (endpoint) => classifyResolvedBrowserAddress(endpoint.address, { viaProxy: false }) !== 'public'
   )
-  if (blocked) {
-    throw new Error(`Public browser blocked a non-public destination: ${blocked.address}`)
-  }
+  if (blocked.length === 0) return
+
+  // Only the fake-IP range can be reconsidered, and only once the proxy is confirmed. This
+  // runs solely on the blocked path, so the ordinary request keeps its single DNS check —
+  // `onBeforeRequest` calls this for every subresource.
+  const proxyWouldAllow = blocked.every(
+    (endpoint) => classifyResolvedBrowserAddress(endpoint.address, { viaProxy: true }) === 'public'
+  )
+  if (proxyWouldAllow && (await isProxiedRequest(browserSession, url.toString()))) return
+
+  throw new Error(`Public browser blocked a non-public destination: ${blocked[0]?.address}`)
 }
 
 const assertPublicUrl = async (browserSession: Session, rawUrl: string): Promise<string> => {
@@ -66,8 +93,7 @@ const assertPublicUrl = async (browserSession: Session, rawUrl: string): Promise
   if (parsed.engine !== 'public-web') {
     throw new Error('Public browser only accepts public HTTP(S) destinations.')
   }
-  const url = new URL(parsed.logicalUrl)
-  await resolvePublicHostname(browserSession, url.hostname)
+  await resolvePublicHostname(browserSession, new URL(parsed.logicalUrl))
   return parsed.logicalUrl
 }
 

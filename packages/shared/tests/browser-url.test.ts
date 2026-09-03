@@ -3,6 +3,7 @@ import {
   BrowserAddressError,
   classifyBrowserHostname,
   classifyResolvedBrowserAddress,
+  isProxiedPacResult,
   formatPreviewTargetUrl,
   parseBrowserAddress,
 } from '../src/browser-url';
@@ -81,9 +82,16 @@ describe('classifyBrowserHostname', () => {
 
 describe('classifyResolvedBrowserAddress', () => {
   it.each(['198.18.0.1', '198.18.3.75', '198.19.255.254', '[::ffff:c612:34b]'])(
-    'accepts %s as a fake-IP proxy answer for a public hostname',
+    'accepts %s as a fake-IP proxy answer once the request is known to be proxied',
     (address) => {
-      expect(classifyResolvedBrowserAddress(address)).toBe('public');
+      expect(classifyResolvedBrowserAddress(address, { viaProxy: true })).toBe('public');
+    }
+  );
+
+  it.each(['198.18.0.1', '198.18.3.75', '198.19.255.254', '[::ffff:c612:34b]'])(
+    'keeps %s prohibited for a direct request, where the address is what gets dialed',
+    (address) => {
+      expect(classifyResolvedBrowserAddress(address, { viaProxy: false })).toBe('prohibited');
     }
   );
 
@@ -97,7 +105,30 @@ describe('classifyResolvedBrowserAddress', () => {
     ['198.51.100.7', 'prohibited'],
     ['[fe80::1]', 'prohibited'],
   ])('still classifies resolved %s as %s', (address, targetClass) => {
-    expect(classifyResolvedBrowserAddress(address)).toBe(targetClass);
+    // A confirmed proxy relaxes the fake-IP range and nothing else.
+    expect(classifyResolvedBrowserAddress(address, { viaProxy: false })).toBe(targetClass);
+    expect(classifyResolvedBrowserAddress(address, { viaProxy: true })).toBe(targetClass);
+  });
+});
+
+describe('isProxiedPacResult', () => {
+  it.each(['PROXY 127.0.0.1:7890', 'SOCKS5 127.0.0.1:7891', 'PROXY a:1; SOCKS5 b:2'])(
+    'treats %s as proxied',
+    (pacResult) => {
+      expect(isProxiedPacResult(pacResult)).toBe(true);
+    }
+  );
+
+  it.each([
+    ['DIRECT', 'a plain direct connection'],
+    ['', 'an empty resolution'],
+    ['   ', 'a blank resolution'],
+    // Chromium walks the list in order and falls back to DIRECT when the proxy is
+    // unreachable, so the address would still be dialed.
+    ['PROXY 127.0.0.1:7890; DIRECT', 'a proxy with a direct fallback'],
+    ['direct', 'a lowercase direct entry'],
+  ])('treats %s as not proxied (%s)', (pacResult) => {
+    expect(isProxiedPacResult(pacResult)).toBe(false);
   });
 });
 
